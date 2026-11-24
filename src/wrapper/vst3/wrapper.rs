@@ -1924,7 +1924,10 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
         *info = mem::zeroed();
         let info = &mut *info;
         info.id = PROGRAM_LIST_ID;
-        u16strlcpy(&mut info.name, "Factory Presets");
+        u16strlcpy(
+            &mut *(info.name.as_mut_ptr() as *mut [TChar; 128]),
+            "Factory Presets",
+        );
         info.program_count = self.inner.factory_presets.len() as i32 + 1;
         kResultOk
     }
