@@ -133,6 +133,11 @@ pub struct Wrapper<P: ClapPlugin> {
     editor_scaling_factor: AtomicF32,
 
     is_processing: AtomicBool,
+    /// Between `activate()` and `deactivate()`: a latency change then needs a restart.
+    is_activated: AtomicBool,
+    /// Inside `activate()`: the host reads the latency when it returns, so a change made there
+    /// needs no callback.
+    in_activate: AtomicBool,
     /// The current IO configuration, modified through the `clap_plugin_audio_ports_config`
     /// extension. Initialized to the plugin's first audio IO configuration.
     current_audio_io_layout: AtomicCell<AudioIOLayout>,
@@ -405,14 +410,13 @@ impl<P: ClapPlugin> MainThreadExecutor<Task<P>> for Wrapper<P> {
                 Some(host_latency) => {
                     nih_debug_assert!(is_gui_thread);
 
-                    // XXX: The CLAP docs mention that you should request a restart if this happens
-                    //      while the plugin is activated (which is not entirely the same thing as
-                    //      is processing, but we'll treat it as the same thing). In practice just
-                    //      calling the latency changed function also seems to work just fine.
-                    if self.is_processing.load(Ordering::SeqCst) {
+                    // `clap_host_latency::changed()` may only be called from within `activate()`.
+                    // An activated plugin asks for a restart (the host deactivates and activates
+                    // it, then reads the new latency); a deactivated one needs nothing, since the
+                    // host reads the latency when it next activates it.
+                    let _ = host_latency;
+                    if self.is_activated.load(Ordering::SeqCst) {
                         unsafe_clap_call! { &*self.host_callback=>request_restart(&*self.host_callback) };
-                    } else {
-                        unsafe_clap_call! { host_latency=>changed(&*self.host_callback) };
                     }
                 }
                 None => nih_debug_assert_failure!("Host does not support the latency extension"),
@@ -556,6 +560,8 @@ impl<P: ClapPlugin> Wrapper<P> {
             editor_scaling_factor: AtomicF32::new(1.0),
 
             is_processing: AtomicBool::new(false),
+            is_activated: AtomicBool::new(false),
+            in_activate: AtomicBool::new(false),
             current_audio_io_layout: AtomicCell::new(
                 P::AUDIO_IO_LAYOUTS.first().copied().unwrap_or_default(),
             ),
@@ -1757,7 +1763,7 @@ impl<P: ClapPlugin> Wrapper<P> {
         // XXX: For CLAP we could move this handling to the Plugin struct, but it may be worthwhile
         //      to keep doing it this way to stay consistent with VST3.
         let old_latency = self.current_latency.swap(samples, Ordering::SeqCst);
-        if old_latency != samples {
+        if old_latency != samples && !self.in_activate.load(Ordering::SeqCst) {
             let task_posted = self.schedule_gui(Task::LatencyChanged);
             nih_debug_assert!(task_posted, "The task queue is full, dropping task...");
         }
@@ -1904,6 +1910,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     ) -> bool {
         check_null_ptr!(false, plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        wrapper.in_activate.store(true, Ordering::SeqCst);
 
         let audio_io_layout = wrapper.current_audio_io_layout.load();
         let buffer_config = BufferConfig {
@@ -1933,8 +1940,11 @@ impl<P: ClapPlugin> Wrapper<P> {
             // Also store this for later, so we can reinitialize the plugin after restoring state
             wrapper.current_buffer_config.store(Some(buffer_config));
 
+            wrapper.in_activate.store(false, Ordering::SeqCst);
+            wrapper.is_activated.store(true, Ordering::SeqCst);
             true
         } else {
+            wrapper.in_activate.store(false, Ordering::SeqCst);
             false
         }
     }
@@ -1942,6 +1952,7 @@ impl<P: ClapPlugin> Wrapper<P> {
     unsafe extern "C" fn deactivate(plugin: *const clap_plugin) {
         check_null_ptr!((), plugin, (*plugin).plugin_data);
         let wrapper = &*((*plugin).plugin_data as *const Self);
+        wrapper.is_activated.store(false, Ordering::SeqCst);
 
         wrapper.plugin.lock().deactivate();
     }
@@ -3186,7 +3197,17 @@ impl<P: ClapPlugin> Wrapper<P> {
         }
         let length = u64::from_le_bytes(length_bytes);
 
-        let mut read_buffer: Vec<u8> = Vec::with_capacity(length as usize);
+        // The length comes from the stream: a damaged or foreign state must not make us try to
+        // allocate an absurd amount (which aborts the host).
+        const MAX_STATE_BYTES: u64 = 256 * 1024 * 1024;
+        if length > MAX_STATE_BYTES {
+            nih_debug_assert_failure!("State length {} is not plausible, not loading", length);
+            return false;
+        }
+        let mut read_buffer: Vec<u8> = Vec::new();
+        if read_buffer.try_reserve_exact(length as usize).is_err() {
+            return false;
+        }
         if !read_stream(&*stream, read_buffer.spare_capacity_mut()) {
             nih_debug_assert_failure!(
                 "Error or end of stream while reading the state buffer from the stream."
@@ -3200,6 +3221,11 @@ impl<P: ClapPlugin> Wrapper<P> {
                 let success = wrapper.set_state_inner(&mut state);
                 if success {
                     nih_trace!("Loaded state ({} bytes)", read_buffer.len());
+                    // The values changed under the host: it re-reads them now (we are on the main
+                    // thread, as `clap_plugin_state::load()` is).
+                    if let Some(host_params) = &*wrapper.host_params.borrow() {
+                        unsafe_clap_call! { host_params=>rescan(&*wrapper.host_callback, CLAP_PARAM_RESCAN_VALUES) };
+                    }
                 }
 
                 success
