@@ -64,6 +64,26 @@ pub(crate) fn make_params_iter<'a>(
     })
 }
 
+/// Writes a factory preset's values into `state` (taken from the plugin's current state), in the
+/// form the parameter's type is saved in. Values for unknown parameter IDs are skipped.
+pub(crate) fn apply_factory_preset(
+    state: &mut PluginState,
+    preset: &crate::plugin::FactoryPreset,
+    params_getter: impl Fn(&str) -> Option<ParamPtr>,
+) {
+    for (id, plain) in &preset.values {
+        let value = match params_getter(id) {
+            Some(ParamPtr::FloatParam(_)) => ParamValue::F32(*plain),
+            Some(ParamPtr::IntParam(_)) | Some(ParamPtr::EnumParam(_)) => {
+                ParamValue::I32(plain.round() as i32)
+            }
+            Some(ParamPtr::BoolParam(_)) => ParamValue::Bool(*plain >= 0.5),
+            None => continue,
+        };
+        state.params.insert(id.clone(), value);
+    }
+}
+
 /// Create a getter function that gets a parameter from the hashtables stored in the plugin by
 /// string ID.
 pub(crate) fn make_params_getter<'a>(

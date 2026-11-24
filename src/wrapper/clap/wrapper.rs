@@ -45,7 +45,14 @@ use clap_sys::ext::render::{
     CLAP_RENDER_REALTIME,
 };
 use clap_sys::ext::state::{clap_plugin_state, CLAP_EXT_STATE};
+use clap_sys::ext::preset_load::{
+    clap_host_preset_load, clap_plugin_preset_load, CLAP_EXT_PRESET_LOAD,
+    CLAP_EXT_PRESET_LOAD_COMPAT,
+};
 use clap_sys::ext::tail::{clap_plugin_tail, CLAP_EXT_TAIL};
+use clap_sys::factory::preset_discovery::{
+    clap_preset_discovery_location_kind, CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN,
+};
 use clap_sys::ext::thread_check::{clap_host_thread_check, CLAP_EXT_THREAD_CHECK};
 use clap_sys::ext::voice_info::{
     clap_host_voice_info, clap_plugin_voice_info, clap_voice_info, CLAP_EXT_VOICE_INFO,
@@ -234,6 +241,11 @@ pub struct Wrapper<P: ClapPlugin> {
     clap_plugin_state: clap_plugin_state,
 
     clap_plugin_tail: clap_plugin_tail,
+
+    clap_plugin_preset_load: clap_plugin_preset_load,
+    host_preset_load: AtomicRefCell<Option<ClapPtr<clap_host_preset_load>>>,
+    /// [`Plugin::factory_presets()`], read once.
+    factory_presets: Vec<crate::plugin::FactoryPreset>,
 
     clap_plugin_voice_info: clap_plugin_voice_info,
     host_voice_info: AtomicRefCell<Option<ClapPtr<clap_host_voice_info>>>,
@@ -669,6 +681,12 @@ impl<P: ClapPlugin> Wrapper<P> {
                 get: Some(Self::ext_voice_info_get),
             },
             host_voice_info: AtomicRefCell::new(None),
+
+            clap_plugin_preset_load: clap_plugin_preset_load {
+                from_location: Some(Self::ext_preset_load_from_location),
+            },
+            host_preset_load: AtomicRefCell::new(None),
+            factory_presets: P::factory_presets(),
             current_voice_capacity: AtomicU32::new(
                 P::CLAP_POLY_MODULATION_CONFIG
                     .map(|c| {
@@ -1855,6 +1873,17 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.host_callback,
             CLAP_EXT_THREAD_CHECK,
         );
+        let mut host_preset_load = query_host_extension::<clap_host_preset_load>(
+            &wrapper.host_callback,
+            CLAP_EXT_PRESET_LOAD,
+        );
+        if host_preset_load.is_none() {
+            host_preset_load = query_host_extension::<clap_host_preset_load>(
+                &wrapper.host_callback,
+                CLAP_EXT_PRESET_LOAD_COMPAT,
+            );
+        }
+        *wrapper.host_preset_load.borrow_mut() = host_preset_load;
 
         true
     }
@@ -2335,6 +2364,10 @@ impl<P: ClapPlugin> Wrapper<P> {
             &wrapper.clap_plugin_state as *const _ as *const c_void
         } else if id == CLAP_EXT_TAIL {
             &wrapper.clap_plugin_tail as *const _ as *const c_void
+        } else if (id == CLAP_EXT_PRESET_LOAD || id == CLAP_EXT_PRESET_LOAD_COMPAT)
+            && !wrapper.factory_presets.is_empty()
+        {
+            &wrapper.clap_plugin_preset_load as *const _ as *const c_void
         } else if id == CLAP_EXT_VOICE_INFO && P::CLAP_POLY_MODULATION_CONFIG.is_some() {
             &wrapper.clap_plugin_voice_info as *const _ as *const c_void
         } else {
@@ -3173,6 +3206,42 @@ impl<P: ClapPlugin> Wrapper<P> {
             }
             None => false,
         }
+    }
+
+    /// Loads the factory preset whose index is `load_key` (see `presets.rs`): its values go into
+    /// the current state, which is then set as the GUI would set it, and the host is told.
+    unsafe extern "C" fn ext_preset_load_from_location(
+        plugin: *const clap_plugin,
+        location_kind: clap_preset_discovery_location_kind,
+        location: *const c_char,
+        load_key: *const c_char,
+    ) -> bool {
+        check_null_ptr!(false, plugin, (*plugin).plugin_data, load_key);
+        let wrapper = &*((*plugin).plugin_data as *const Self);
+        if location_kind != CLAP_PRESET_DISCOVERY_LOCATION_PLUGIN {
+            return false;
+        }
+        let preset = CStr::from_ptr(load_key)
+            .to_str()
+            .ok()
+            .and_then(|k| k.parse::<usize>().ok())
+            .and_then(|i| wrapper.factory_presets.get(i));
+        let Some(preset) = preset else {
+            return false;
+        };
+        let mut state = wrapper.get_state_object();
+        state::apply_factory_preset(
+            &mut state,
+            preset,
+            state::make_params_getter(&wrapper.param_by_hash, &wrapper.param_id_to_hash),
+        );
+        wrapper.set_state_object_from_gui(state);
+        if let Some(host_preset_load) = &*wrapper.host_preset_load.borrow() {
+            if let Some(loaded) = host_preset_load.loaded {
+                loaded(&*wrapper.host_callback, location_kind, location, load_key);
+            }
+        }
+        true
     }
 
     unsafe extern "C" fn ext_tail_get(plugin: *const clap_plugin) -> u32 {

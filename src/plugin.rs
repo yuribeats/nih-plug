@@ -178,6 +178,15 @@ pub trait Plugin: Default + Send + 'static {
     /// This is an advanced feature that the vast majority of plugins won't need to implement.
     fn filter_state(state: &mut PluginState) {}
 
+    /// Factory presets offered to the host: a CLAP preset-discovery provider and the
+    /// `clap.preset-load` extension (which clap-wrapper turns into Audio Unit factory presets),
+    /// and a VST3 program list with a program-change parameter. Loading one sets the parameters it
+    /// names (by parameter ID) and keeps the others. Called off the audio thread. The order is the
+    /// presets' numbering in hosts that store a number, so only append to it.
+    fn factory_presets() -> Vec<FactoryPreset> {
+        Vec::new()
+    }
+
     //
     // The following functions follow the lifetime of the plugin.
     //
@@ -252,6 +261,15 @@ pub trait Plugin: Default + Send + 'static {
     /// `initialize()` may be called more than once before `deactivate()` is called, for instance
     /// when restoring state while the plugin is still activate.
     fn deactivate(&mut self) {}
+}
+
+/// A factory preset, see [`Plugin::factory_presets()`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FactoryPreset {
+    /// The name hosts show.
+    pub name: String,
+    /// `(parameter ID, plain value)` for every parameter the preset sets.
+    pub values: Vec<(String, f32)>,
 }
 
 /// Indicates the current situation after the plugin has processed audio.

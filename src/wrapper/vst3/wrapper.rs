@@ -25,6 +25,11 @@ use super::util::{
     u16strlcpy, VstPtr, VST3_MIDI_CCS, VST3_MIDI_NUM_PARAMS, VST3_MIDI_PARAMS_START,
 };
 use super::util::{VST3_MIDI_CHANNELS, VST3_MIDI_PARAMS_END};
+
+/// The program-change parameter of a plugin with factory presets, just under the MIDI CC range.
+const PROGRAM_PARAM_ID: u32 = VST3_MIDI_PARAMS_START - 1;
+/// The id of the factory presets' program list.
+const PROGRAM_LIST_ID: i32 = 1;
 use super::view::WrapperView;
 use crate::prelude::{
     AuxiliaryBuffers, BufferConfig, MidiConfig, NoteEvent, ParamFlags, ProcessMode, ProcessStatus,
@@ -54,6 +59,19 @@ pub struct Wrapper<P: Vst3Plugin> {
 impl<P: Vst3Plugin> Wrapper<P> {
     pub fn new() -> Box<Self> {
         Self::allocate(WrapperInner::new())
+    }
+
+    /// The program (0 for none, then 1 + a preset's index) at a normalized value of the
+    /// program-change parameter.
+    fn program_of(&self, normalized: f64) -> u32 {
+        let steps = self.inner.factory_presets.len() as f64;
+        (normalized.clamp(0.0, 1.0) * steps).round() as u32
+    }
+
+    /// The program-change parameter's normalized value for `program`.
+    fn program_normalized(&self, program: u32) -> f64 {
+        let steps = self.inner.factory_presets.len().max(1) as f64;
+        (f64::from(program) / steps).clamp(0.0, 1.0)
     }
 }
 
@@ -514,11 +532,13 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn get_parameter_count(&self) -> i32 {
+        // One more for the program-change parameter when there are factory presets
+        let programs = i32::from(!self.inner.factory_presets.is_empty());
         // We need to add a whole bunch of parameters if the plugin accepts MIDI CCs
         if P::MIDI_INPUT >= MidiConfig::MidiCCs {
-            self.inner.param_hashes.len() as i32 + VST3_MIDI_NUM_PARAMS as i32
+            self.inner.param_hashes.len() as i32 + programs + VST3_MIDI_NUM_PARAMS as i32
         } else {
-            self.inner.param_hashes.len() as i32
+            self.inner.param_hashes.len() as i32 + programs
         }
     }
 
@@ -529,7 +549,7 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     ) -> tresult {
         check_null_ptr!(info);
 
-        if param_index < 0 || param_index > self.get_parameter_count() {
+        if param_index < 0 || param_index >= self.get_parameter_count() {
             return kInvalidArgument;
         }
 
@@ -539,8 +559,17 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
         // If the parameter is a generated MIDI CC/channel pressure/pitch bend then it needs to be
         // handled separately
         let num_actual_params = self.inner.param_hashes.len() as i32;
-        if P::MIDI_INPUT >= MidiConfig::MidiCCs && param_index >= num_actual_params {
-            let midi_param_relative_idx = (param_index - num_actual_params) as u32;
+        let programs = i32::from(!self.inner.factory_presets.is_empty());
+        if programs == 1 && param_index == num_actual_params {
+            info.id = PROGRAM_PARAM_ID;
+            u16strlcpy(&mut info.title, "Program");
+            u16strlcpy(&mut info.short_title, "Program");
+            info.step_count = self.inner.factory_presets.len() as i32;
+            info.default_normalized_value = 0.0;
+            info.unit_id = kRootUnitId;
+            info.flags = ParameterFlags::kIsProgramChange as i32 | ParameterFlags::kIsList as i32;
+        } else if P::MIDI_INPUT >= MidiConfig::MidiCCs && param_index >= num_actual_params {
+            let midi_param_relative_idx = (param_index - num_actual_params - programs) as u32;
             // This goes up to 130 for the 128 CCs followed by channel pressure and pitch bend
             let midi_cc = midi_param_relative_idx % VST3_MIDI_CCS;
             let midi_channel = midi_param_relative_idx / VST3_MIDI_CCS;
@@ -602,6 +631,15 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
 
         let dest = &mut *(string as *mut [TChar; 128]);
 
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            let name = match self.program_of(value_normalized) {
+                0 => "(none)",
+                n => self.inner.factory_presets[n as usize - 1].name.as_str(),
+            };
+            u16strlcpy(dest, name);
+            return kResultOk;
+        }
+
         // TODO: We don't implement these methods at all for our generated MIDI CC parameters,
         //       should be fine right? They should be hidden anyways.
         match self.inner.param_by_hash.get(&id) {
@@ -630,6 +668,21 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
             Err(_) => return kInvalidArgument,
         };
 
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            let found = self
+                .inner
+                .factory_presets
+                .iter()
+                .position(|p| p.name.eq_ignore_ascii_case(string.trim()));
+            return match found {
+                Some(i) => {
+                    *value_normalized = self.program_normalized(i as u32 + 1);
+                    kResultOk
+                }
+                None => kResultFalse,
+            };
+        }
+
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => {
                 let value = match param_ptr.string_to_normalized_value(&string) {
@@ -645,6 +698,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn normalized_param_to_plain(&self, id: u32, value_normalized: f64) -> f64 {
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            return self.program_of(value_normalized) as f64;
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.preview_plain(value_normalized as f32) as f64,
             _ => value_normalized,
@@ -652,6 +708,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn plain_param_to_normalized(&self, id: u32, plain_value: f64) -> f64 {
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            return self.program_normalized(plain_value.round().max(0.0) as u32);
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.preview_normalized(plain_value as f32) as f64,
             _ => plain_value,
@@ -659,6 +718,9 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn get_param_normalized(&self, id: u32) -> f64 {
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            return self.program_normalized(self.inner.current_program.load(Ordering::SeqCst));
+        }
         match self.inner.param_by_hash.get(&id) {
             Some(param_ptr) => param_ptr.modulated_normalized_value() as f64,
             _ => 0.5,
@@ -666,6 +728,18 @@ impl<P: Vst3Plugin> IEditController for Wrapper<P> {
     }
 
     unsafe fn set_param_normalized(&self, id: u32, value: f64) -> tresult {
+        // The program-change parameter loads a factory preset when it moves to another one,
+        // whether or not audio is being processed (the preset is a state change, which
+        // `set_state_object_from_gui()` hands to the audio thread when needed).
+        if id == PROGRAM_PARAM_ID && !self.inner.factory_presets.is_empty() {
+            let program = self.program_of(value);
+            let old = self.inner.current_program.swap(program, Ordering::SeqCst);
+            if program != old && program > 0 {
+                self.inner.load_factory_preset(program as usize - 1);
+            }
+            return kResultOk;
+        }
+
         // If the plugin is currently processing audio, then this parameter change will also be sent
         // to the process function
         if self.inner.is_processing.load(Ordering::SeqCst) {
@@ -1794,11 +1868,29 @@ impl<P: Vst3Plugin> IProcessContextRequirements for Wrapper<P> {
 
 impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
     unsafe fn get_unit_count(&self) -> i32 {
-        self.inner.param_units.len() as i32
+        // With factory presets the root unit is listed too, as the owner of the program list
+        self.inner.param_units.len() as i32 + i32::from(!self.inner.factory_presets.is_empty())
     }
 
     unsafe fn get_unit_info(&self, unit_index: i32, info: *mut UnitInfo) -> tresult {
         check_null_ptr!(info);
+
+        let mut unit_index = unit_index;
+        if !self.inner.factory_presets.is_empty() {
+            if unit_index == 0 {
+                *info = mem::zeroed();
+                let info = &mut *info;
+                info.id = kRootUnitId;
+                info.parent_unit_id = kNoParentUnitId;
+                u16strlcpy(&mut info.name, "Root");
+                info.program_list_id = PROGRAM_LIST_ID;
+                return kResultOk;
+            }
+            unit_index -= 1;
+        }
+        if unit_index < 0 {
+            return kInvalidArgument;
+        }
 
         match self.inner.param_units.info(unit_index as usize) {
             Some((unit_id, unit_info)) => {
@@ -1817,25 +1909,45 @@ impl<P: Vst3Plugin> IUnitInfo for Wrapper<P> {
     }
 
     unsafe fn get_program_list_count(&self) -> i32 {
-        // TODO: Do we want program lists? Probably not, CLAP doesn't even support them.
-        0
+        i32::from(!self.inner.factory_presets.is_empty())
     }
 
     unsafe fn get_program_list_info(
         &self,
-        _list_index: i32,
-        _info: *mut ProgramListInfo,
+        list_index: i32,
+        info: *mut ProgramListInfo,
     ) -> tresult {
-        kInvalidArgument
+        check_null_ptr!(info);
+        if list_index != 0 || self.inner.factory_presets.is_empty() {
+            return kInvalidArgument;
+        }
+        *info = mem::zeroed();
+        let info = &mut *info;
+        info.id = PROGRAM_LIST_ID;
+        u16strlcpy(&mut info.name, "Factory Presets");
+        info.program_count = self.inner.factory_presets.len() as i32 + 1;
+        kResultOk
     }
 
     unsafe fn get_program_name(
         &self,
-        _list_id: i32,
-        _program_index: i32,
-        _name: *mut u16,
+        list_id: i32,
+        program_index: i32,
+        name: *mut u16,
     ) -> tresult {
-        kInvalidArgument
+        check_null_ptr!(name);
+        if list_id != PROGRAM_LIST_ID || program_index < 0 {
+            return kInvalidArgument;
+        }
+        let text = match program_index as usize {
+            0 => "(none)",
+            i => match self.inner.factory_presets.get(i - 1) {
+                Some(p) => p.name.as_str(),
+                None => return kInvalidArgument,
+            },
+        };
+        u16strlcpy(&mut *(name as *mut [TChar; 128]), text);
+        kResultOk
     }
 
     unsafe fn get_program_info(

@@ -4,6 +4,7 @@ mod util;
 mod context;
 mod descriptor;
 pub mod features;
+pub mod presets;
 mod wrapper;
 
 /// Re-export for the macro
@@ -11,6 +12,9 @@ pub use self::descriptor::PluginDescriptor;
 pub use self::wrapper::Wrapper;
 pub use clap_sys::entry::clap_plugin_entry;
 pub use clap_sys::factory::plugin_factory::{clap_plugin_factory, CLAP_PLUGIN_FACTORY_ID};
+pub use clap_sys::factory::preset_discovery::{
+    CLAP_PRESET_DISCOVERY_FACTORY_ID, CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT,
+};
 pub use clap_sys::host::clap_host;
 pub use clap_sys::plugin::{clap_plugin, clap_plugin_descriptor};
 pub use clap_sys::version::CLAP_VERSION;
@@ -121,8 +125,19 @@ macro_rules! nih_export_clap {
             pub extern "C" fn deinit() {}
 
             pub extern "C" fn get_factory(factory_id: *const c_char) -> *const c_void {
-                if !factory_id.is_null() && unsafe { CStr::from_ptr(factory_id) } == CLAP_PLUGIN_FACTORY_ID {
+                if factory_id.is_null() {
+                    return ::std::ptr::null();
+                }
+                let id = unsafe { CStr::from_ptr(factory_id) };
+                if id == CLAP_PLUGIN_FACTORY_ID {
                     &CLAP_PLUGIN_FACTORY as *const _ as *const c_void
+                } else if id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID
+                    || id == $crate::wrapper::clap::CLAP_PRESET_DISCOVERY_FACTORY_ID_COMPAT
+                {
+                    fn providers() -> Vec<Option<$crate::wrapper::clap::presets::PresetProvider>> {
+                        vec![$($crate::wrapper::clap::presets::PresetProvider::for_plugin::<$plugin_ty>()),+]
+                    }
+                    $crate::wrapper::clap::presets::factory(providers)
                 } else {
                     ::std::ptr::null()
                 }

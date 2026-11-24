@@ -132,6 +132,12 @@ pub(crate) struct WrapperInner<P: Vst3Plugin> {
     /// Mappings from string parameter identifiers to parameter hashes. Useful for debug logging
     /// and when storing and restoring plugin state.
     pub param_id_to_hash: HashMap<String, u32>,
+
+    /// [`Plugin::factory_presets()`], read once: the program list and its program-change
+    /// parameter (see `wrapper.rs`). Empty when the plugin has none.
+    pub factory_presets: Vec<crate::plugin::FactoryPreset>,
+    /// The program-change parameter's value: 0 for none, then 1 + the preset's index.
+    pub current_program: std::sync::atomic::AtomicU32,
     /// The inverse mapping from [`param_by_hash`][Self::param_by_hash]. This is needed to be able
     /// to have an ergonomic parameter setting API that uses references to the parameters instead of
     /// having to add a setter function to the parameter (or even worse, have it be completely
@@ -318,6 +324,9 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             param_units,
             param_id_to_hash,
             param_ptr_to_hash,
+
+            factory_presets: P::factory_presets(),
+            current_program: std::sync::atomic::AtomicU32::new(0),
         });
 
         // FIXME: Right now this is safe, but if we are going to have a singleton main thread queue
@@ -459,6 +468,22 @@ impl<P: Vst3Plugin> WrapperInner<P> {
             }
             _ => kInvalidArgument,
         }
+    }
+
+    /// Loads factory preset `index`: its values go into the current state, which is then set as
+    /// the GUI would set it (the host is told the parameters changed).
+    pub fn load_factory_preset(&self, index: usize) -> bool {
+        let Some(preset) = self.factory_presets.get(index) else {
+            return false;
+        };
+        let mut state = self.get_state_object();
+        crate::wrapper::state::apply_factory_preset(
+            &mut state,
+            preset,
+            crate::wrapper::state::make_params_getter(&self.param_by_hash, &self.param_id_to_hash),
+        );
+        self.set_state_object_from_gui(state);
+        true
     }
 
     /// Get the plugin's state object, may be called by the plugin's GUI as part of its own preset
